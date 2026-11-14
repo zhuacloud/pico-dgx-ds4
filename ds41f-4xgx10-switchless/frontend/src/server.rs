@@ -5,7 +5,7 @@
 //! matched to a session for prefix reuse, sent to rank 0, and the streamed ids are decoded, checked
 //! for stop strings and loops, and parsed into reasoning, content and tool calls.
 
-use crate::encoding::{api_tool_name, encode_messages, Delta, EncodeOptions, Encoding, StreamParser, ThinkingMode};
+use crate::encoding::{api_tool_name, encode_messages, Delta, EncodeOptions, Encoding, StreamCollect, StreamParser, ThinkingMode};
 use crate::engine::{EngineClient, Event as EngineEvent};
 use crate::gate::{Gate, Pass, Refused, RETRY_AFTER_S};
 use crate::guard::{LoopGuard, StopMatcher, LINE_WINDOW_TOKENS};
@@ -577,7 +577,7 @@ impl Gen {
                         self.flush(out);
                     }
                     self.parser.finish(out);
-                    let finish = if self.parser.tool_calls_seen() > 0 {
+                    let finish = if self.parser.tool_calls_seen() > 0 && !self.parser.calls_truncated() {
                         Finish::ToolCalls
                     } else if let Some(f) = self.stopped {
                         f
@@ -846,23 +846,23 @@ async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> R
     let created = now_secs();
     let model = app.cfg.model_name.clone();
     // non-streaming
-    let (mut reasoning, mut content, mut calls) = (String::new(), String::new(), Vec::new());
+    let mut acc = StreamCollect::default();
     let mut out = Vec::new();
     let (finish, usage) = loop {
         let end = gen.next(&mut out).await;
-        for d in out.drain(..) {
-            match d {
-                Delta::Reasoning(s) => reasoning.push_str(&s),
-                Delta::Content(s) => content.push_str(&s),
-                Delta::ToolCall(_, name, args) => calls.push(tool_call_json(app.cfg.encoding, None, app.random_hex(24), &name, args)),
-            }
-        }
+        acc.drain(&mut out);
         match end {
             None => continue,
             Some(Ok(x)) => break x,
             Some(Err(e)) => return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e),
         }
     };
+    let calls: Vec<Value> = acc
+        .calls
+        .iter()
+        .map(|(name, args)| tool_call_json(app.cfg.encoding, None, app.random_hex(24), name, args.clone()))
+        .collect();
+    let (reasoning, content) = (acc.reasoning, acc.content);
     let mut message = json!({"role": "assistant",
         "content": if content.is_empty() && !calls.is_empty() { Value::Null } else { json!(content) }});
     if p.mode == ThinkingMode::Thinking {
@@ -933,6 +933,9 @@ fn stream(app: Arc<App>, p: Prepared, req: Value, pass: Option<Pass>) -> Respons
         if send(chunk(json!({"role": "assistant", "content": ""}), None)).await.is_err() {
             return;
         }
+        // The streamed tool calls' ids, one per index: every fragment of a call carries the same
+        // one, so a client assembles one call in the OpenAI shape.
+        let mut call_ids: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
         let mut out = Vec::new();
         loop {
             let end = gen.next(&mut out).await;
@@ -940,9 +943,14 @@ fn stream(app: Arc<App>, p: Prepared, req: Value, pass: Option<Pass>) -> Respons
                 let delta = match d {
                     Delta::Reasoning(s) => json!({"reasoning_content": s}),
                     Delta::Content(s) => json!({"content": s}),
-                    Delta::ToolCall(i, name, args) => {
-                        json!({"tool_calls": [tool_call_json(app.cfg.encoding, Some(i), app.random_hex(24), &name, args)]})
+                    Delta::ToolCallStart { index, name } => {
+                        let id = call_ids.entry(index).or_insert_with(|| app.random_hex(24)).clone();
+                        json!({"tool_calls": [tool_call_json(app.cfg.encoding, Some(index), id, &name, String::new())]})
                     }
+                    Delta::ToolCallArgs { index, fragment } => {
+                        json!({"tool_calls": [{"index": index, "function": {"arguments": fragment}}]})
+                    }
+                    Delta::ToolCallEnd { .. } => continue,
                 };
                 if send(chunk(delta, None)).await.is_err() {
                     return; // client gone; dropping gen cancels the request

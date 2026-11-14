@@ -314,7 +314,7 @@ fn tokcheck(args: &[String]) {
 
 /// Compare encoding.rs with encoding.py's output (tools/gen_encoding_cases.py).
 fn enccheck(args: &[String]) {
-    use dsfront::encoding::{encode_messages, parse_message_from_completion_text, Delta, EncodeOptions, StreamParser, ThinkingMode};
+    use dsfront::encoding::{encode_messages, parse_message_from_completion_text, EncodeOptions, StreamCollect, StreamParser, ThinkingMode};
     use serde_json::Value;
     let path = args.get(2).unwrap_or_else(|| usage());
     let f = std::fs::File::open(path).unwrap_or_else(|e| {
@@ -414,14 +414,9 @@ fn enccheck(args: &[String]) {
                 p.finish(&mut out);
                 if let Ok(m) = got {
                     n_stream += 1;
-                    let (mut r, mut ct, mut calls) = (String::new(), String::new(), Vec::new());
-                    for d in out {
-                        match d {
-                            Delta::Reasoning(s) => r.push_str(&s),
-                            Delta::Content(s) => ct.push_str(&s),
-                            Delta::ToolCall(_, n, a) => calls.push((n, a)),
-                        }
-                    }
+                    let mut acc = StreamCollect::default();
+                    acc.drain(&mut out);
+                    let (r, ct, calls) = (acc.reasoning, acc.content, acc.calls);
                     if r != m.reasoning_content || ct != m.content || calls != m.tool_calls {
                         report(&name, format!("stream differs: reasoning {r:?} content {ct:?} calls {calls:?}\n  want {m:?}"));
                     }

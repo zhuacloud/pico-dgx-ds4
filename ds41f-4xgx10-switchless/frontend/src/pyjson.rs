@@ -50,6 +50,14 @@ fn write_value(out: &mut String, v: &Value) {
 
 fn write_str(out: &mut String, s: &str) {
     out.push('"');
+    escape_into(out, s);
+    out.push('"');
+}
+
+/// The escaping of a JSON string's body, without the quotes: `write_str`'s rules, for a value that
+/// arrives in pieces (a streamed tool call's arguments). Concatenating the escapes of successive
+/// pieces gives the escape of their concatenation.
+pub fn escape_into(out: &mut String, s: &str) {
     for c in s.chars() {
         match c {
             '"' => out.push_str("\\\""),
@@ -63,7 +71,6 @@ fn write_str(out: &mut String, s: &str) {
             c => out.push(c),
         }
     }
-    out.push('"');
 }
 
 /// Whether Python's json module would read this number literal as an int.
